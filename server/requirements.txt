@@ -1,0 +1,12 @@
+# Сервер (server.py): галерея, загрузка фото и видео
+flask>=2.2
+
+# Превью фото и просмотр HEIC (без них галерея работает, но без превью)
+pillow>=10.0
+pillow-heif>=0.13
+
+# Перехват трафика Диска (capture_addon.py). Запуск: mitmdump -s capture_addon.py --listen-port 8000
+mitmproxy>=10.0
+
+# recover.py и recover_runner.py используют только стандартную библиотеку (Python 3.8+).
+# Вне pip нужен ffmpeg в PATH: сборка повреждённых видео и превью видео в галерее.
