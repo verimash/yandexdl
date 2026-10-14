@@ -12,6 +12,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write   # нужно job'у release ниже, чтобы создать GitHub Release
+
 jobs:
   build:
     strategy:
@@ -20,10 +23,16 @@ jobs:
         include:
           - os: windows-latest
             artifact: YandexDLDesktop-windows
+            vendor_dir: win32
+            ff_name: ffmpeg.exe
           - os: macos-latest
             artifact: YandexDLDesktop-macos
+            vendor_dir: darwin
+            ff_name: ffmpeg
           - os: ubuntu-latest
             artifact: YandexDLDesktop-linux
+            vendor_dir: linux
+            ff_name: ffmpeg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -39,15 +48,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libxcb-cursor0 \
-            libnss3 libxcomposite1 libxdamage1 libxrandr2 libxtst6 libgbm1 ffmpeg
+            libnss3 libxcomposite1 libxdamage1 libxrandr2 libxtst6 libgbm1
 
-      - name: ffmpeg (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
+      # Статический ffmpeg под КАЖДУЮ из трёх ОС (johnvansickle/gyan.dev/evermeet.cx —
+      # ровно те источники, что были бы и при ручной сборке), чтобы ПОЛОЖИТЬ его
+      # в vendor/ffmpeg/<os>/ и yandexdl.spec забандлил его в сборку. Без этого шага
+      # итоговый exe/app/бинарник работал бы, но конвертация видео падала бы у
+      # любого пользователя без своего ffmpeg в PATH.
+      - name: Скачать статический ffmpeg
+        id: ffmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
 
-      - name: ffmpeg (Windows)
-        if: runner.os == 'Windows'
-        run: choco install ffmpeg -y
+      - name: Положить ffmpeg в vendor/ (чтобы попал в сборку)
+        shell: bash
+        run: |
+          mkdir -p "vendor/ffmpeg/${{ matrix.vendor_dir }}"
+          cp "${{ steps.ffmpeg.outputs.ffmpeg-path }}/${{ matrix.ff_name }}" \
+             "vendor/ffmpeg/${{ matrix.vendor_dir }}/${{ matrix.ff_name }}"
 
       - name: Python-зависимости
         run: |
@@ -75,3 +92,22 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
           retention-days: 90
+
+  # Только по тегу (v1.0.0 и т.п.) — собирает три zip'а из job'а build выше и
+  # публикует их в GitHub Release с этим тегом (релиз создаётся, если его ещё
+  # нет). По ручному запуску (workflow_dispatch) релиз не создаётся — только
+  # артефакты в Actions, см. job build.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          draft: false
+          generate_release_notes: true
