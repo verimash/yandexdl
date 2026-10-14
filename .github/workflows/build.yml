@@ -55,11 +55,14 @@ jobs:
       # в vendor/ffmpeg/<os>/ и yandexdl.spec забандлил его в сборку. Без этого шага
       # итоговый exe/app/бинарник работал бы, но конвертация видео падала бы у
       # любого пользователя без своего ffmpeg в PATH.
-      - name: Скачать статический ffmpeg
+      
+      - name: Скачать статический ffmpeg (Windows/Linux)
         id: ffmpeg
+        if: runner.os != 'macOS'
         uses: FedericoCarboni/setup-ffmpeg@v3
 
       - name: Положить ffmpeg в vendor/ (чтобы попал в сборку)
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           mkdir -p "vendor/ffmpeg/${{ matrix.vendor_dir }}"
