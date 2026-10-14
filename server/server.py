@@ -50,8 +50,95 @@ DAYS_PER_CHUNK = 10  # сколько дней отдаём за одну под
 
 # --- скачивание файлов ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILES_DIR = os.environ.get("YDISK_FILES", os.path.join(BASE_DIR, "files"))
+DEFAULT_FILES_DIR = os.environ.get("YDISK_FILES", os.path.join(BASE_DIR, "files"))
 THUMBS_DIR = os.environ.get("YDISK_THUMBS", os.path.join(BASE_DIR, "thumbs"))
+
+
+class _FilesDirHolder:
+    """Папка для фото/видео можно сменить на лету (например, на другой диск —
+    C: часто маленький). Храним путь в settings (ключ files_dir), а не в
+    константе, чтобы его можно было поменять без перезапуска сервера."""
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.lock = threading.Lock()
+
+
+_files_dir_holder = _FilesDirHolder(DEFAULT_FILES_DIR)
+
+
+def files_dir():
+    return _files_dir_holder.path
+
+
+def validate_writable_dir(path):
+    """Пытается создать папку и правда ли в неё можно писать. Возвращает
+    (abs_path, None) при успехе либо (None, текст ошибки)."""
+    if not path or not str(path).strip():
+        return None, "путь не может быть пустым"
+    abspath = os.path.abspath(os.path.expanduser(str(path).strip()))
+    try:
+        os.makedirs(abspath, exist_ok=True)
+    except OSError as e:
+        return None, f"не удалось создать папку: {e}"
+    probe = os.path.join(abspath, f".ydisk_write_test_{os.getpid()}_{random.randint(0, 999999)}")
+    try:
+        with open(probe, "wb") as f:
+            f.write(b"ok")
+    except OSError as e:
+        return None, f"нет прав на запись в эту папку: {e}"
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+    return abspath, None
+
+
+def set_files_dir(path):
+    """Проверяет путь и, если он доступен для записи и обе загрузки сейчас
+    не идут, переключает files_dir() на него. Существующие уже скачанные
+    файлы НЕ переносятся — только новые скачивания пойдут в новую папку."""
+    if DL.state() != "idle" or VD.state() != "idle":
+        return None, "сначала останови загрузку (фото и видео), потом меняй папку"
+    abspath, err = validate_writable_dir(path)
+    if err:
+        return None, err
+    with _files_dir_holder.lock:
+        _files_dir_holder.path = abspath
+        set_setting("files_dir", abspath)
+    return abspath, None
+
+
+def load_files_dir_setting():
+    saved = get_setting("files_dir")
+    if not saved:
+        return
+    abspath, err = validate_writable_dir(saved)
+    if err:
+        print(f"(!) сохранённая папка для файлов недоступна ({saved}): {err} — использую {files_dir()}")
+        return
+    _files_dir_holder.path = abspath
+
+
+def verify_saved_file(root, relative_path, expected_size=None, min_size=1):
+    """Проверяет, что итоговый файл существует внутри выбранной папки сохранения."""
+    root_real = os.path.realpath(root)
+    candidate = os.path.realpath(os.path.join(root_real, relative_path))
+    try:
+        if os.path.commonpath((root_real, candidate)) != root_real:
+            raise OSError("итоговый путь оказался за пределами папки сохранения")
+    except ValueError as e:
+        raise OSError("итоговый путь оказался за пределами папки сохранения") from e
+    if not os.path.isfile(candidate):
+        raise OSError(f"файл не найден после сохранения: {relative_path}")
+    actual_size = os.path.getsize(candidate)
+    if actual_size < min_size:
+        raise OSError(f"файл слишком мал после сохранения: {relative_path} ({actual_size} байт)")
+    if expected_size is not None and actual_size != expected_size:
+        raise OSError(f"размер файла после сохранения не совпадает: {actual_size}/{expected_size} байт")
+    return candidate
+
+
 THUMB_MAX_BYTES = 30 * 1024  # целевой размер превью
 THUMB_SIDE = 360             # длинная сторона превью, px (если не влезает в 30 КБ — уменьшаем)
 QUEUE_SIZE = 100            # сколько файлов всегда ждут в очереди
@@ -61,13 +148,13 @@ MAX_THREADS = 32
 SIZE_ORDER = ["ORIGINAL", "XXXL", "XXL", "XL", "L", "M", "S", "XS", "XXS", "XXXS", "DEFAULT"]
 ATTEMPT_TIMEOUT = 10        # сек: на соединение и на ожидание каждого блока данных
 ATTEMPT_DEADLINE = 180      # сек: потолок на одну попытку целиком (против «капающих» соединений)
-FAIL_STREAK_STOP = 15       # столько файлов подряд без успеха — автоматически останавливаемся
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 DL_COLUMNS = {
     "dl_status": "TEXT",     # NULL / queued / downloading / done / failed
     "dl_size": "TEXT",       # ORIGINAL / XXXL / ... — что реально скачали
-    "dl_file": "TEXT",       # путь относительно files/
+    "dl_file": "TEXT",       # путь относительно корня, сохранённого в dl_root
+    "dl_root": "TEXT",       # абсолютный корень, где лежит этот скачанный файл
     "dl_bytes": "INTEGER",
     "dl_error": "TEXT",
     "dl_attempts": "TEXT",
@@ -77,7 +164,8 @@ DL_COLUMNS = {
 VD_COLUMNS = {
     "vd_status": "TEXT",     # NULL / queued / downloading / done / failed
     "vd_phase": "TEXT",
-    "vd_file": "TEXT",       # путь относительно files/
+    "vd_file": "TEXT",       # путь относительно корня, сохранённого в vd_root
+    "vd_root": "TEXT",       # абсолютный корень, где лежит этот скачанный файл
     "vd_bytes": "INTEGER",   # размер файла на Диске
     "vd_lost": "INTEGER",    # сколько байт потеряно (0 — оригинал без потерь)
     "vd_error": "TEXT",
@@ -256,7 +344,7 @@ def upsert_resource(c, r, ts):
             resource_id = COALESCE(excluded.resource_id, items.resource_id),
             file_id     = COALESCE(excluded.file_id, items.file_id),
             cluster_id  = COALESCE(items.cluster_id, excluded.cluster_id),
-            raw         = excluded.raw,
+            raw         = excluded.raw,  -- свежий снимок ресурса заменяет устаревшие подписанные download URL
             updated_at  = excluded.updated_at
         """,
         (
@@ -933,6 +1021,8 @@ def build_opener():
     return urllib.request.build_opener(*handlers)
 
 
+# Статус done хранится в SQLite и не сбрасывается при проверке наличия файла:
+# если пользователь позже удалит файл вручную, загрузчик не будет качать его повторно.
 ELIGIBLE = "mediatype='image' AND raw IS NOT NULL AND dl_status IS NULL"
 ELIGIBLE_VD = "mediatype='video' AND raw IS NOT NULL AND vd_status IS NULL"
 GALLERY_ORDER = "ORDER BY COALESCE(taken,'') DESC, name DESC"   # как в галерее: сверху вниз
@@ -954,7 +1044,6 @@ class Downloader:
         self.refill_lock = threading.Lock()
         self.window = deque()              # (monotonic, bytes) для скорости
         self.session = {"done": 0, "failed": 0, "bytes": 0, "started": None}
-        self.fail_streak = 0
         self.message = ""
         self.opener = build_opener()
 
@@ -986,7 +1075,6 @@ class Downloader:
             self.stop_event.clear()
             self.finishing.clear()
             self.message = ""
-            self.fail_streak = 0
             self.workers = {}
             with self.alock:
                 self.active = {}
@@ -1093,28 +1181,24 @@ class Downloader:
             self.refill()
 
     def _set_item(self, path, status, size=None, file=None, nbytes=None, error=None, attempts=None):
+        # Запоминаем корень отдельно: смена папки сохранения не должна ломать доступ
+        # к файлам, которые были скачаны раньше.
+        saved_root = os.path.abspath(files_dir()) if status == "done" else None
         with dbc() as c:
             c.execute(
-                "UPDATE items SET dl_status=?, dl_size=?, dl_file=?, dl_bytes=?, dl_error=?, dl_attempts=?, dl_at=? WHERE path=?",
-                (status, size, file, nbytes, (error or None) and error[:500],
+                "UPDATE items SET dl_status=?, dl_size=?, dl_file=?, dl_root=?, dl_bytes=?, dl_error=?, dl_attempts=?, dl_at=? WHERE path=?",
+                (status, size, file, saved_root, nbytes, (error or None) and error[:500],
                  json.dumps(attempts, ensure_ascii=False) if attempts else None, now_iso(), path),
             )
 
     def _on_result(self, ok, nbytes=0):
+        # Ошибки отдельных файлов не останавливают очередь: она идёт до конца.
         with self.slock:
             if ok:
                 self.session["done"] += 1
                 self.session["bytes"] += nbytes
-                self.fail_streak = 0
             else:
                 self.session["failed"] += 1
-                self.fail_streak += 1
-                if self.fail_streak >= FAIL_STREAK_STOP and not self.stop_event.is_set():
-                    self.message = (f"{self.fail_streak} файлов подряд не скачались — остановился. "
-                                    "Возможно, ссылки протухли (HTTP 403): прокрути ленту на Диске заново "
-                                    "через mitmproxy, чтобы обновить ссылки, и нажми «Повторить ошибки». "
-                                    "Либо облако сейчас недоступно.")
-                    self.stop_event.set()
 
     def _record_fail(self, path, error, attempts):
         self._set_item(path, "failed", error=error, attempts=attempts)
@@ -1164,7 +1248,7 @@ class Downloader:
                 self.active.pop(path, None)
 
     def _fetch(self, path, name, day, size, url, prog):
-        day_dir = os.path.join(FILES_DIR, day)
+        day_dir = os.path.join(files_dir(), day)
         os.makedirs(day_dir, exist_ok=True)
         tag = hashlib.md5(path.encode("utf-8")).hexdigest()[:8]
         tmp = os.path.join(day_dir, f".{tag}.{size}.part")
@@ -1211,7 +1295,17 @@ class Downloader:
                 s2, e2 = os.path.splitext(final)
                 final = f"{s2}_{tag}{e2}"
                 rel = f"{day}/{final}"
-            os.replace(tmp, os.path.join(day_dir, final))
+            final_path = os.path.join(day_dir, final)
+            os.replace(tmp, final_path)
+            try:
+                verify_saved_file(files_dir(), rel, expected_size=got)
+            except OSError:
+                # Не оставляем файл, который не прошёл проверку, как будто он сохранён корректно.
+                try:
+                    os.remove(final_path)
+                except OSError:
+                    pass
+                raise
             return rel, got
         finally:
             if os.path.exists(tmp):
@@ -1279,7 +1373,7 @@ class Downloader:
             "message": self.message,
             "threads": self.threads,
             "queue_size": QUEUE_SIZE,
-            "files_dir": os.path.abspath(FILES_DIR),
+            "files_dir": os.path.abspath(files_dir()),
             "speed": speed,
             "session": dict(self.session),
             "counts": counts,
@@ -1368,7 +1462,7 @@ class VideoDownloader:
       3. нет потерь: сырой файл = оригинал, кладём как есть; есть потери: recover.py --skip-download
          (ffmpeg: переупаковка или перекодирование) -> <имя>.recovered.mp4.
     Ссылку recover.py получает через stdin (в списке процессов её не видно).
-    Прогресс между запусками хранится в files/<дата>/.vd/<метка>/v.state.json — после остановки докачка продолжается.
+    Прогресс между запусками хранится в files_dir()/<дата>/.vd/<метка>/v.state.json — после остановки докачка продолжается.
     """
 
     def __init__(self):
@@ -1546,11 +1640,12 @@ class VideoDownloader:
             self.refill()
 
     def _set_video(self, path, status, phase=None, file=None, nbytes=None, lost=None, error=None, note=None):
+        saved_root = os.path.abspath(files_dir()) if status == "done" else None
         with dbc() as c:
             c.execute(
-                "UPDATE items SET vd_status=?, vd_phase=?, vd_file=?, vd_bytes=?, vd_lost=?, vd_error=?, vd_note=?, vd_at=? "
+                "UPDATE items SET vd_status=?, vd_phase=?, vd_file=?, vd_root=?, vd_bytes=?, vd_lost=?, vd_error=?, vd_note=?, vd_at=? "
                 "WHERE path=?",
-                (status, phase, file, nbytes, lost, (error or None) and error[:500], note, now_iso(), path))
+                (status, phase, file, saved_root, nbytes, lost, (error or None) and error[:500], note, now_iso(), path))
 
     def _on_result(self, ok, nbytes=0):
         with self.slock:
@@ -1678,7 +1773,7 @@ class VideoDownloader:
         path, name = row["path"], row["name"]
         day = (row["taken"] or "")[:10] or "no-date"
         tag = hashlib.md5(path.encode("utf-8")).hexdigest()[:8]
-        workdir = os.path.join(FILES_DIR, day, ".vd", tag)
+        workdir = os.path.join(files_dir(), day, ".vd", tag)
         os.makedirs(workdir, exist_ok=True)
         out = os.path.join(workdir, "v.mp4")
         base = os.path.join(workdir, "v")
@@ -1760,7 +1855,8 @@ class VideoDownloader:
 
         if lost == 0:
             rel = self._unique_rel(day, safe_name(name), path, tag)
-            move_over(raw, os.path.join(FILES_DIR, rel))
+            move_over(raw, os.path.join(files_dir(), rel))
+            verify_saved_file(files_dir(), rel, expected_size=size)
             shutil.rmtree(workdir, ignore_errors=True)
             self._set_video(path, "done", phase="done", file=rel, nbytes=size, lost=0, note="оригинал без потерь")
             self._on_result(True, size)
@@ -1774,13 +1870,14 @@ class VideoDownloader:
         if os.path.isfile(out) and os.path.getsize(out) > 2048:
             stem = os.path.splitext(safe_name(name))[0]
             rel = self._unique_rel(day, f"{stem}.recovered.mp4", path, tag)
-            move_over(out, os.path.join(FILES_DIR, rel))
+            move_over(out, os.path.join(files_dir(), rel))
+            verify_saved_file(files_dir(), rel, min_size=2049)
             try:
                 os.remove(base + ".patched.mp4")
             except OSError:
                 pass
             note = (f"потеряно {human_size(lost)} из {human_size(size)} ({100.0 * lost / size:.2f}%); "
-                    f"сырые данные: files/{day}/.vd/{tag}/")
+                    f"сырые данные: {os.path.join(files_dir(), day, '.vd', tag)}")
             self._set_video(path, "done", phase="done", file=rel, nbytes=size, lost=lost, note=note)
             self._on_result(True, size)
             return
@@ -1849,7 +1946,7 @@ class VideoDownloader:
             "settings": dict(self.settings),
             "limits": VD_LIMITS,
             "queue_size": VD_QUEUE_SIZE,
-            "files_dir": os.path.abspath(FILES_DIR),
+            "files_dir": os.path.abspath(files_dir()),
             "have_ffmpeg": bool(shutil.which("ffmpeg")),
             "auth": auth_summary(),
             "session": dict(self.session),
@@ -1865,7 +1962,7 @@ VD = VideoDownloader()
 
 
 def cleanup_part_files():
-    for root, _dirs, files in os.walk(FILES_DIR):
+    for root, _dirs, files in os.walk(files_dir()):
         for f in files:
             if f.endswith(".part"):
                 try:
@@ -1885,6 +1982,20 @@ def _require_json_for_post():
 @app.get("/status")
 def status_page():
     return Response(STATUS_HTML, mimetype="text/html")
+
+
+@app.get("/api/settings/files-dir")
+def api_files_dir_get():
+    return jsonify(ok=True, dir=files_dir())
+
+
+@app.post("/api/settings/files-dir")
+def api_files_dir_set():
+    body = request.get_json(silent=True) or {}
+    abspath, err = set_files_dir(body.get("dir", ""))
+    if err:
+        return jsonify(ok=False, error=err), 400
+    return jsonify(ok=True, dir=abspath)
 
 
 @app.get("/api/dl/status")
@@ -2030,6 +2141,12 @@ STATUS_HTML = r"""<!doctype html>
     <button id="btnRetry">Повторить ошибки</button>
   </div>
   <div class="mut" id="dir"></div>
+  <div class="controls" style="margin-top:4px">
+    <span class="mut">папка для файлов (общая для фото и видео):</span>
+    <input id="dirInput" type="text" style="min-width:320px" placeholder="например, D:\\YandexPhotos или /mnt/data/photos">
+    <button id="btnDirApply">Сменить</button>
+  </div>
+  <div class="mut" id="dirMsg" style="margin-top:2px"></div>
   <div class="msg" id="msg" hidden></div>
 
   <div class="cards" id="cards"></div>
@@ -2157,6 +2274,8 @@ STATUS_HTML = r"""<!doctype html>
     $('btnRetry').textContent = 'Повторить ошибки' + (c.failed ? ` (${c.failed})` : '');
     if (document.activeElement !== $('threads')) $('threads').value = s.threads;
     $('dir').textContent = 'Папка: ' + s.files_dir + '/<дата>/';
+    if (document.activeElement !== $('dirInput')) $('dirInput').value = s.files_dir;
+    $('btnDirApply').disabled = s.state !== 'idle';
     $('msg').hidden = !s.message; $('msg').textContent = s.message || '';
 
     const cards = [
@@ -2321,6 +2440,12 @@ STATUS_HTML = r"""<!doctype html>
   $('btnStop').onclick = async () => { await api('/api/dl/stop', {}); refresh(); };
   $('btnThreads').onclick = async () => { await api('/api/dl/threads', { threads: parseInt($('threads').value, 10) }); $('threads').blur(); refresh(); };
   $('btnRetry').onclick = async () => { await api('/api/dl/retry-failed', {}); refresh(); };
+  $('btnDirApply').onclick = async () => {
+    $('dirMsg').textContent = 'проверяю...';
+    const r = await api('/api/settings/files-dir', { dir: $('dirInput').value });
+    $('dirMsg').textContent = r.ok ? ('Готово, теперь папка: ' + r.dir) : ('Ошибка: ' + r.error);
+    refresh();
+  };
 
   $('vStart').onclick = async () => { if (vDirty) await applyV(); const r = await api('/api/vd/start', {}); if (r.error) alert(r.error); refresh(); };
   $('vStop').onclick = async () => { await api('/api/vd/stop', {}); refresh(); };
@@ -2408,18 +2533,28 @@ def _video_poster(src, dst_jpg):
 def _done_file(rid):
     """Абсолютный путь скачанного файла по номеру строки (фото или видео), либо None."""
     with dbc() as c:
-        row = c.execute("SELECT dl_status, dl_file, vd_status, vd_file FROM items WHERE rowid=?", (rid,)).fetchone()
+        row = c.execute(
+            "SELECT dl_status, dl_file, dl_root, vd_status, vd_file, vd_root FROM items WHERE rowid=?", (rid,)
+        ).fetchone()
     if not row:
         return None
-    rel = row["vd_file"] if row["vd_status"] == "done" and row["vd_file"] else (
-        row["dl_file"] if row["dl_status"] == "done" else None)
-    if not rel:
+    if row["vd_status"] == "done" and row["vd_file"]:
+        rel = row["vd_file"]
+        # Для строк из старых баз, где корень ещё не хранился, используем путь по умолчанию.
+        root = row["vd_root"] or DEFAULT_FILES_DIR
+    elif row["dl_status"] == "done" and row["dl_file"]:
+        rel = row["dl_file"]
+        root = row["dl_root"] or DEFAULT_FILES_DIR
+    else:
         return None
-    src = os.path.realpath(os.path.join(FILES_DIR, rel))
-    root = os.path.realpath(FILES_DIR)
-    if not src.startswith(root + os.sep) or not os.path.isfile(src):
+    root = os.path.realpath(os.path.abspath(root))
+    src = os.path.realpath(os.path.join(root, rel))
+    try:
+        if os.path.commonpath((root, src)) != root:
+            return None
+    except ValueError:
         return None
-    return src
+    return src if os.path.isfile(src) else None
 
 
 @app.get("/thumb/<int:rid>")
@@ -2489,13 +2624,14 @@ def open_file(rid):
 if __name__ == "__main__":
     init_db()
     init_auth_db()
-    os.makedirs(FILES_DIR, exist_ok=True)
+    load_files_dir_setting()
+    os.makedirs(files_dir(), exist_ok=True)
     os.makedirs(THUMBS_DIR, exist_ok=True)
     cleanup_part_files()
     DL.load_settings()
     VD.load_settings()
     print(f"DB: {DB_PATH}\nАвторизация: {AUTH_DB_PATH}")
-    print(f"Файлы: {FILES_DIR}\nПревью: {THUMBS_DIR}" + ("" if HAVE_PIL else "  (!) нет Pillow: pip install pillow"))
+    print(f"Файлы: {files_dir()}\nПревью: {THUMBS_DIR}" + ("" if HAVE_PIL else "  (!) нет Pillow: pip install pillow"))
     if not shutil.which("ffmpeg"):
         print("(!) ffmpeg не найден в PATH: повреждённые видео не соберутся, у видео не будет превью")
     print(f"Статус загрузки: http://{HOST}:{PORT}/status")
