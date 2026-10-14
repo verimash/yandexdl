@@ -106,6 +106,7 @@ def set_files_dir(path):
     with _files_dir_holder.lock:
         _files_dir_holder.path = abspath
         set_setting("files_dir", abspath)
+    reconcile_existing_downloads()
     return abspath, None
 
 
@@ -361,6 +362,15 @@ def ingest(payload: dict):
     ts = now_iso()
     clusters = (payload.get("clusters") or {}).get("fetched") or []
     resources = (payload.get("resources") or {}).get("fetched") or []
+    affected_paths = set()
+    for cl in clusters:
+        for it in cl.get("items") or []:
+            if it.get("id"):
+                affected_paths.add(it["id"])
+    for r in resources:
+        path = r.get("path") or r.get("id")
+        if path:
+            affected_paths.add(path)
 
     with db() as c:
         before = c.execute("SELECT COUNT(*) FROM items").fetchone()[0]
@@ -379,6 +389,10 @@ def ingest(payload: dict):
             upsert_resource(c, r, ts)
 
         after = c.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+
+    # Если данные о файле появились уже после запуска, тоже проверяем, не лежит ли
+    # он на диске с предыдущего запуска/версии программы.
+    reconcile_existing_downloads(affected_paths)
 
     return {
         "clusters": len(clusters),
@@ -884,7 +898,7 @@ FRAGMENT = """{% for day, items in groups %}
       {% if got %}<img src="/thumb/{{ it.rid }}" loading="lazy" decoding="async" alt="" onerror="this.parentNode.classList.remove('has-img');this.remove()">{% endif %}
       {% if it.mediatype=='video' %}<span class="badge">▶{% if it.duration_ms %} {{ dur(it.duration_ms) }}{% endif %}</span>{% endif %}
       {% if it.dl_status=='done' and it.dl_size %}<span class="dl{{ ' low' if it.dl_size!='ORIGINAL' }}">{{ it.dl_size }}</span>{% endif %}
-      {% if it.mediatype=='video' and it.vd_status=='done' %}<span class="dl{{ ' low' if it.vd_lost }}">{% if it.vd_lost %}потеряно {{ it.lostpct }}%{% else %}оригинал{% endif %}</span>{% endif %}
+      {% if it.mediatype=='video' and it.vd_status=='done' %}<span class="dl{{ ' low' if it.vd_lost }}">{% if it.is_local_existing %}уже на диске{% elif it.vd_lost %}потеряно {{ it.lostpct }}%{% else %}оригинал{% endif %}</span>{% endif %}
       <span class="tname">{{ it.name }}</span>
     </div>
     {% endfor %}
@@ -917,7 +931,7 @@ def load_chunk(args, before=None):
             where = f"{sql} AND {cond}" if sql else f" WHERE {cond}"
             rows = c.execute(
                 "SELECT rowid AS rid,name,taken,mediatype,size,width,height,duration_ms,dl_status,dl_size,"
-                "vd_status,vd_lost "
+                "vd_status,vd_lost,vd_note "
                 f"FROM items{where} ORDER BY COALESCE(taken,'') DESC, name DESC",
                 params + days,
             ).fetchall()
@@ -926,6 +940,7 @@ def load_chunk(args, before=None):
     for r in rows:
         d = dict(r)
         d["lostpct"] = round(100.0 * d["vd_lost"] / d["size"], 1) if d.get("vd_lost") and d.get("size") else 0
+        d["is_local_existing"] = d.get("vd_note") == LOCAL_EXISTING_FILE_NOTE
         by_day[(r["taken"] or "")[:10]].append(d)
     groups = [(d, by_day[d]) for d in days]
     cursor = days[-1] if days else None
@@ -987,6 +1002,208 @@ _BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 def safe_name(s):
     return _BAD_CHARS.sub("_", s or "").strip() or "file"
+
+
+LOCAL_EXISTING_FILE_NOTE = (
+    "Найден ранее сохранённый локальный файл; его содержимое повторно не проверялось."
+)
+
+
+def _local_file_candidates(row, is_video):
+    """Кандидаты имён, которые создаёт загрузчик для этого элемента."""
+    path = row["path"]
+    name = safe_name(row["name"] or name_from_path(path))
+    day = (row["taken"] or "")[:10] or "no-date"
+    tag = hashlib.md5(path.encode("utf-8")).hexdigest()[:8]
+    stem, source_ext = os.path.splitext(name)
+    result = []
+    seen = set()
+
+    def add(filename, label, recovered=False):
+        rel = os.path.join(day, filename)
+        key = (rel, label, recovered)
+        if key not in seen:
+            seen.add(key)
+            result.append((rel, label, recovered))
+
+    if is_video:
+        add(name, "LOCAL", False)
+        if source_ext:
+            add(f"{stem}_{tag}{source_ext}", "LOCAL", False)
+        recovered = f"{stem}.recovered.mp4"
+        add(recovered, "LOCAL", True)
+        add(f"{stem}.recovered_{tag}.mp4", "LOCAL", True)
+        return result
+
+    add(name, "ORIGINAL", False)
+    if source_ext:
+        add(f"{stem}_{tag}{source_ext}", "ORIGINAL", False)
+
+    output_exts = sorted(set(EXT_BY_CTYPE.values()) | {".jpg"})
+    for quality in SIZE_ORDER:
+        if quality == "ORIGINAL":
+            continue
+        for ext in output_exts:
+            add(f"{stem}.{quality}{ext}", quality, False)
+            add(f"{stem}.{quality}_{tag}{ext}", quality, False)
+    return result
+
+
+def reconcile_existing_downloads(paths=None):
+    """Помечает как done файлы, уже существующие в каталоге загрузок.
+
+    Статус done никогда не сбрасывается из-за отсутствующего файла: это намеренно,
+    чтобы ручное удаление файла не запускало повторную загрузку автоматически.
+    Если старый статус done указывает на устаревший корень, при обнаружении файла
+    в другом известном каталоге обновляем только путь к нему.
+    """
+    roots = []
+    for candidate in (files_dir(), DEFAULT_FILES_DIR):
+        root = os.path.abspath(os.path.expanduser(candidate))
+        if root not in roots:
+            roots.append(root)
+
+    if paths is None:
+        with dbc() as c:
+            rows = c.execute(
+                "SELECT path,name,taken,mediatype,size,dl_status,dl_size,dl_file,dl_root,"
+                "vd_status,vd_file,vd_root,vd_lost,vd_note FROM items "
+                "ORDER BY CASE WHEN dl_status='done' OR vd_status='done' THEN 0 ELSE 1 END, path"
+            ).fetchall()
+    else:
+        unique_paths = list(dict.fromkeys(str(p) for p in paths if p))
+        rows = []
+        # SQLite на некоторых версиях ограничивает число параметров запроса.
+        with dbc() as c:
+            for start in range(0, len(unique_paths), 800):
+                batch = unique_paths[start:start + 800]
+                marks = ",".join("?" for _ in batch)
+                rows.extend(c.execute(
+                    "SELECT path,name,taken,mediatype,size,dl_status,dl_size,dl_file,dl_root,"
+                    "vd_status,vd_file,vd_root,vd_lost,vd_note FROM items "
+                    f"WHERE path IN ({marks}) ORDER BY CASE WHEN dl_status='done' OR vd_status='done' THEN 0 ELSE 1 END, path",
+                    batch,
+                ).fetchall())
+
+    # Кэшируем имена файлов по каталогу с датой — тысячи элементов одного дня
+    # не должны приводить к тысячам повторных os.listdir().
+    dir_cache = {}
+    claimed = {}
+    counts = {"photos": 0, "videos": 0, "repaired_roots": 0}
+    now = now_iso()
+
+    def root_order(row, is_video):
+        saved = row["vd_root"] if is_video else row["dl_root"]
+        ordered = []
+        if saved:
+            ordered.append(os.path.abspath(os.path.expanduser(saved)))
+        ordered.extend(roots)
+        out = []
+        for item in ordered:
+            real = os.path.realpath(item)
+            if real not in out:
+                out.append(real)
+        return out
+
+    def try_relative(root, rel, item_path):
+        if not rel:
+            return None
+        rel_norm = os.path.normpath(str(rel))
+        owner = claimed.get((os.path.realpath(root), rel_norm))
+        if owner and owner != item_path:
+            return None
+        try:
+            candidate = verify_saved_file(root, rel_norm, min_size=1)
+            size = os.path.getsize(candidate)
+        except (OSError, TypeError, ValueError):
+            return None
+        return {"root": os.path.realpath(root), "rel": rel_norm, "size": size,
+                "label": None, "recovered": ".recovered" in os.path.basename(rel_norm)}
+
+    def locate(row, is_video):
+        field_file = "vd_file" if is_video else "dl_file"
+        field_status = "vd_status" if is_video else "dl_status"
+        stored_rel = row[field_file]
+        status_done = row[field_status] == "done"
+        roots_for_item = root_order(row, is_video)
+
+        # Сначала используем конкретное имя из старой БД, если файл действительно есть.
+        if status_done and stored_rel:
+            for root in roots_for_item:
+                match = try_relative(root, stored_rel, row["path"])
+                if match:
+                    return match
+
+        # Иначе пытаемся сопоставить файлы по дате, исходному имени и схеме имён загрузчика.
+        candidates = _local_file_candidates(row, is_video)
+        for root in roots_for_item:
+            for rel, label, recovered in candidates:
+                day = os.path.dirname(rel) or "."
+                cache_key = (root, day)
+                if cache_key not in dir_cache:
+                    try:
+                        dir_cache[cache_key] = set(os.listdir(os.path.join(root, day)))
+                    except OSError:
+                        dir_cache[cache_key] = set()
+                if os.path.basename(rel) not in dir_cache[cache_key]:
+                    continue
+                match = try_relative(root, rel, row["path"])
+                if match:
+                    match["label"] = label
+                    match["recovered"] = recovered
+                    return match
+        return None
+
+    with dbc() as c:
+        for row in rows:
+            if not row["path"] or not row["name"]:
+                continue
+            is_video = (row["mediatype"] == "video" or
+                        (row["mediatype"] is None and guess_mediatype(row["name"]) == "video"))
+            status_key = "vd_status" if is_video else "dl_status"
+            file_key = "vd_file" if is_video else "dl_file"
+            root_key = "vd_root" if is_video else "dl_root"
+            is_already_done = row[status_key] == "done"
+            match = locate(row, is_video)
+            if not match:
+                # Важно: не сбрасываем done, даже если файла больше нет на диске.
+                continue
+
+            claim_key = (match["root"], os.path.normpath(match["rel"]))
+            claimed[claim_key] = row["path"]
+            rel = match["rel"]
+            root = match["root"]
+            size = match["size"]
+            old_root = row[root_key]
+            old_rel = row[file_key]
+
+            if is_video:
+                # Если обнаружен восстановленный вариант, точный объём потерь неизвестен;
+                # отдельно помечаем его как найденный локальный файл, не как новый recover.
+                c.execute(
+                    "UPDATE items SET vd_status='done', vd_phase='done', vd_file=?, vd_root=?, "
+                    "vd_bytes=?, vd_lost=COALESCE(vd_lost,0), vd_error=NULL, "
+                    "vd_note=CASE WHEN vd_status='done' THEN COALESCE(vd_note, ?) ELSE ? END, "
+                    "vd_at=COALESCE(vd_at, ?) WHERE path=?",
+                    (rel, root, size, LOCAL_EXISTING_FILE_NOTE, LOCAL_EXISTING_FILE_NOTE, now, row["path"]),
+                )
+            else:
+                label = match["label"] or row["dl_size"] or "ORIGINAL"
+                c.execute(
+                    "UPDATE items SET dl_status='done', dl_size=?, dl_file=?, dl_root=?, dl_bytes=?, "
+                    "dl_error=NULL, dl_attempts=NULL, dl_at=COALESCE(dl_at, ?) WHERE path=?",
+                    (label, rel, root, size, now, row["path"]),
+                )
+
+            if is_already_done:
+                if old_root != root or old_rel != rel:
+                    counts["repaired_roots"] += 1
+            elif is_video:
+                counts["videos"] += 1
+            else:
+                counts["photos"] += 1
+
+    return counts
 
 
 def short_err(e):
@@ -2627,6 +2844,7 @@ if __name__ == "__main__":
     load_files_dir_setting()
     os.makedirs(files_dir(), exist_ok=True)
     os.makedirs(THUMBS_DIR, exist_ok=True)
+    print(f"Проверяю существующие файлы: {reconcile_existing_downloads()}")
     cleanup_part_files()
     DL.load_settings()
     VD.load_settings()

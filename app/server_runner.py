@@ -59,8 +59,11 @@ class ServerThread(threading.Thread):
 
         mod.init_db()
         mod.init_auth_db()
-        os.makedirs(mod.FILES_DIR, exist_ok=True)
+        # Apply a previously selected output directory before scanning files.
+        mod.load_files_dir_setting()
+        os.makedirs(mod.files_dir(), exist_ok=True)
         os.makedirs(mod.THUMBS_DIR, exist_ok=True)
+        self.on_log(f"[server] проверка существующих файлов: {mod.reconcile_existing_downloads()}")
         mod.cleanup_part_files()
         mod.DL.load_settings()
         mod.VD.load_settings()
