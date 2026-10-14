@@ -1,0 +1,77 @@
+name: build
+
+# Собирает бинарник под все три ОС сразу (PyInstaller не кросс-компилирует —
+# поэтому матрица из трёх раннеров, а не один джоб). Готовые архивы появляются
+# в разделе Actions -> этот run -> Artifacts, хранятся 90 дней.
+#
+# Запуск: вручную (кнопка "Run workflow" на вкладке Actions) или по тегу v*.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: YandexDLDesktop-windows
+          - os: macos-latest
+            artifact: YandexDLDesktop-macos
+          - os: ubuntu-latest
+            artifact: YandexDLDesktop-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Linux: PySide6/QtWebEngine тянут системные библиотеки, которых нет на
+      # голом ubuntu-latest раннере.
+      - name: Системные зависимости (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libxcb-cursor0 \
+            libnss3 libxcomposite1 libxdamage1 libxrandr2 libxtst6 libgbm1 ffmpeg
+
+      - name: ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y
+
+      - name: Python-зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Сборка (PyInstaller)
+        run: pyinstaller yandexdl.spec
+
+      - name: Запаковать dist (Linux/Windows)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          cd dist
+          7z a -r "../${{ matrix.artifact }}.zip" "YandexDLDesktop" || zip -r "../${{ matrix.artifact }}.zip" "YandexDLDesktop"
+
+      - name: Запаковать .app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "YandexDLDesktop.app" "../${{ matrix.artifact }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          retention-days: 90

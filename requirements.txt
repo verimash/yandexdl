@@ -1,0 +1,22 @@
+# GUI + встроенный браузер.
+# >=6.7 ОБЯЗАТЕЛЬНО: сигнал QWebEnginePage.webAuthUxRequested (вход по Face ID/
+# Touch ID/Windows Hello/ключу безопасности) появился именно в Qt 6.7.
+# На более старых версиях вкладка с Диском будет открываться и работать нормально,
+# но окно для входа по отпечатку/лицу просто не будет появляться.
+PySide6>=6.7
+
+# Flask-сервер (server/server.py) — без изменений
+flask>=2.2
+
+# превью фото и HEIC в галерее
+pillow>=10.0
+pillow-heif>=0.13
+
+# подключение к Chrome DevTools Protocol встроенного браузера
+websocket-client>=1.7
+
+# recover.py / recover_runner.py — только stdlib (Python 3.8+)
+# ffmpeg нужен отдельно, в PATH (не из pip)
+
+# --- только для сборки бинарника (pip install -r requirements-build.txt) ---
+# см. requirements-build.txt и build.md

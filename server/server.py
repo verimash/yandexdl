@@ -638,6 +638,19 @@ PAGE = """<!doctype html>
   nav a.on { color:var(--fg); font-weight:600; }
   #status { color:var(--mut); text-align:center; padding:28px 0; min-height:20px; }
   .empty { color:var(--mut); margin-top:30px; }
+
+  #viewer { position:fixed; inset:0; z-index:100; display:flex; align-items:center; justify-content:center;
+            background:rgba(0,0,0,.82); backdrop-filter:blur(2px); padding:40px; }
+  #viewer[hidden] { display:none; }
+  #viewer .vwrap { position:relative; max-width:100%; max-height:100%; display:flex; }
+  #viewer img, #viewer video { display:block; max-width:100%; max-height:calc(100vh - 80px); border-radius:4px;
+                                box-shadow:0 10px 40px rgba(0,0,0,.5); }
+  #viewer .vclose { position:absolute; top:-18px; right:-18px; width:36px; height:36px; border-radius:50%;
+                     background:#1c1c20; color:#fff; border:1px solid rgba(255,255,255,.2); font-size:18px;
+                     line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  #viewer .vclose:hover { background:#2a2a30; }
+  #viewer .vcaption { position:absolute; left:0; right:0; bottom:-30px; text-align:center; color:#cfcfd6;
+                       font-size:12px; word-break:break-all; }
 </style>
 </head>
 <body>
@@ -672,6 +685,14 @@ PAGE = """<!doctype html>
   <div id="sentinel"></div>
   <div id="status"></div>
 </main>
+
+<div id="viewer" hidden>
+  <div class="vwrap">
+    <button class="vclose" type="button" aria-label="Закрыть" title="Закрыть (Esc)">✕</button>
+    <span class="vcaption"></span>
+  </div>
+</div>
+
 <script>
   const FILTERS = {{ base|tojson }};
   let cursor = {{ cursor|tojson }};          // последний показанный день (null — ничего нет)
@@ -681,6 +702,46 @@ PAGE = """<!doctype html>
   const list = document.getElementById('list');
   const statusEl = document.getElementById('status');
   const sentinel = document.getElementById('sentinel');
+
+  // просмотр фото/видео поверх галереи (вместо target=_blank — во встроенной
+  // вкладке приложения новые окна/вкладки не открываются)
+  const viewer = document.getElementById('viewer');
+  const vwrap = viewer.querySelector('.vwrap');
+  const vcaption = viewer.querySelector('.vcaption');
+  let vmedia = null;
+
+  function closeViewer() {
+    viewer.hidden = true;
+    document.body.style.overflow = '';
+    if (vmedia) { vmedia.pause && vmedia.pause(); vmedia.remove(); vmedia = null; }
+  }
+
+  function openViewer(rid, type, name) {
+    if (vmedia) vmedia.remove();
+    vmedia = document.createElement(type === 'video' ? 'video' : 'img');
+    if (type === 'video') { vmedia.controls = true; vmedia.autoplay = true; }
+    else { vmedia.alt = name || ''; }
+    vmedia.src = '/file/' + rid;
+    vwrap.insertBefore(vmedia, vcaption);
+    vcaption.textContent = name || '';
+    viewer.hidden = false;
+    document.body.style.overflow = 'hidden';
+  }
+
+  list.addEventListener('click', (e) => {
+    const a = e.target.closest('a.open');
+    if (!a) return;
+    e.preventDefault();
+    openViewer(a.dataset.rid, a.dataset.type, a.dataset.name);
+  });
+
+  viewer.addEventListener('click', (e) => {
+    if (e.target === viewer) closeViewer();   // клик по затемнённому фону
+  });
+  viewer.querySelector('.vclose').onclick = closeViewer;
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !viewer.hidden) closeViewer();
+  });
 
   // размер плиток
   const sizeEl = document.getElementById('size');
@@ -731,7 +792,7 @@ FRAGMENT = """{% for day, items in groups %}
     {% for it in items %}
     {% set got = it.dl_status=='done' or (it.mediatype=='video' and it.vd_status=='done') %}
     <div class="tile{{ ' has-img' if got }}" title="{{ it.name }}{% if it.size %} · {{ human(it.size) }}{% endif %}{% if it.width and it.height %} · {{ it.width }}×{{ it.height }}{% endif %}">
-      {% if got %}<a class="open" href="/file/{{ it.rid }}" target="_blank" rel="noopener"></a>{% endif %}
+      {% if got %}<a class="open" href="/file/{{ it.rid }}" data-rid="{{ it.rid }}" data-type="{{ it.mediatype }}" data-name="{{ it.name }}" rel="noopener"></a>{% endif %}
       {% if got %}<img src="/thumb/{{ it.rid }}" loading="lazy" decoding="async" alt="" onerror="this.parentNode.classList.remove('has-img');this.remove()">{% endif %}
       {% if it.mediatype=='video' %}<span class="badge">▶{% if it.duration_ms %} {{ dur(it.duration_ms) }}{% endif %}</span>{% endif %}
       {% if it.dl_status=='done' and it.dl_size %}<span class="dl{{ ' low' if it.dl_size!='ORIGINAL' }}">{{ it.dl_size }}</span>{% endif %}
