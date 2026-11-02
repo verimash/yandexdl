@@ -40,6 +40,56 @@ TARGET_MODEL = "photo-get-clusters-with-resources"
 TARGET_HOST_HINT = "disk.yandex"
 YANDEX_BASES = ("yandex.ru", "yandex.com", "ya.ru", "yandex.net")
 
+# --- автоскролл ленты: крутит вкладку Диска вниз, чтобы захват сам набрал метаданные,
+#     без ручной прокрутки. Включается YDISK_AUTOSCROLL=1. ---
+AUTOSCROLL = bool(os.environ.get("YDISK_AUTOSCROLL"))
+AUTOSCROLL_INTERVAL = float(os.environ.get("YDISK_AUTOSCROLL_INTERVAL", "1.0"))   # пауза между шагами, сек
+# Сколько шагов подряд БЕЗ роста высоты И уже у самого низа ленты считаем концом.
+# Держим с запасом: при аварии ЦОД подгрузка тормозит, и пара пустых шагов — это
+# не конец ленты, а просто задержка сети. Лучше лишний раз подождать, чем
+# оборвать скролл на середине и недобрать метаданные.
+AUTOSCROLL_IDLE_PASSES = int(os.environ.get("YDISK_AUTOSCROLL_IDLE", "20"))       # шагов без роста у дна -> конец
+AUTOSCROLL_END_ROUNDS = int(os.environ.get("YDISK_AUTOSCROLL_END_ROUNDS", "5"))  # подтверждений конца подряд
+# Перед скроллом ждём, пока Flask поднимется (первый запуск долго сверяет файлы),
+# иначе первые ingest'ы уходят в ещё не слушающий порт -> «refused» (10061).
+AUTOSCROLL_WAIT_SERVER = float(os.environ.get("YDISK_AUTOSCROLL_WAIT", "300"))    # сек ждать сервер
+SERVER_BASE = SERVER_URL.rsplit("/api/", 1)[0]                                     # http://127.0.0.1:<port>
+
+# --- дамп первого перехваченного payload в файл (для изучения структуры API).
+#     Включается YDISK_DUMP=1; путь можно задать YDISK_DUMP_PATH. ---
+DUMP_PAYLOAD = bool(os.environ.get("YDISK_DUMP"))
+DUMP_PATH = os.environ.get("YDISK_DUMP_PATH") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "_sample_payload.json"
+)
+_dump_done = threading.Lock()
+_dump_written = [False]
+
+# JS: плавно прокрутить ленту на ОДИН экран вниз (не прыгать в самый низ — лента
+# виртуализирована, при прыжке промежуточные карточки не отрисуются и захват их
+# пропустит). Скроллим и window, и внутренний скролл-контейнер. Возвращаем
+# [scrollTop, scrollHeight], чтобы снаружи понять, дошли ли до низа.
+_SCROLL_JS = """
+(function () {
+  // ищем реальный скролл-контейнер ленты; если нет — работаем с window/документом
+  var best = null, bestH = 0;
+  document.querySelectorAll('*').forEach(function (el) {
+    if (el.scrollHeight > el.clientHeight + 200 && el.clientHeight > 300) {
+      if (el.scrollHeight > bestH) { bestH = el.scrollHeight; best = el; }
+    }
+  });
+  if (best) {
+    var step = Math.max(200, best.clientHeight - 100);
+    best.scrollTop = best.scrollTop + step;
+    return [best.scrollTop + best.clientHeight, best.scrollHeight];
+  }
+  var h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  var vh = window.innerHeight || 800;
+  window.scrollBy(0, Math.max(200, vh - 100));
+  var y = (window.scrollY || window.pageYOffset || 0) + vh;
+  return [y, h];
+})();
+"""
+
 SK_RE = re.compile(r'"sk"\s*:\s*"([^"]+)"')
 CID_RE = re.compile(r'"connection_id"\s*:\s*"([^"]+)"')
 
@@ -197,7 +247,10 @@ class _TabWatcher(threading.Thread):
             return
         self._ws.settimeout(1.0)
         self._send("Network.enable", {})
+        self._send("Runtime.enable", {})
         self.on_log(f"[cdp] слушаю вкладку {self.target_id}")
+        if AUTOSCROLL:
+            threading.Thread(target=self._autoscroll_loop, daemon=True).start()
         try:
             while not self._stop.is_set():
                 try:
@@ -405,10 +458,102 @@ class _TabWatcher(threading.Thread):
         n_resources = len(payload.get("resources", {}).get("fetched", []))
         self.on_log(f"[cdp] перехвачено: кластеров={n_clusters}, ресурсов={n_resources}")
         self.on_count(n_clusters, n_resources)
+        self._maybe_dump(payload)
         try:
-            _post_json(SERVER_URL, payload)
+            _post_json(SERVER_URL, payload, timeout=60)
         except Exception as e:  # noqa: BLE001
             self.on_log(f"[cdp] не удалось отправить на сервер: {e}")
+
+    def _maybe_dump(self, payload):
+        """Один раз сохраняет сырой payload в файл для изучения структуры API."""
+        if not DUMP_PAYLOAD or _dump_written[0]:
+            return
+        with _dump_done:
+            if _dump_written[0]:
+                return
+            try:
+                os.makedirs(os.path.dirname(DUMP_PATH), exist_ok=True)
+                with open(DUMP_PATH, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                _dump_written[0] = True
+                self.on_log(f"[cdp] payload сохранён для анализа -> {DUMP_PATH}")
+            except Exception as e:  # noqa: BLE001
+                self.on_log(f"[cdp] не удалось сохранить payload: {e}")
+
+    # ---------- автоскролл ленты
+
+    def _wait_server(self) -> bool:
+        """Ждём, пока Flask начнёт отвечать (первый запуск долго сверяет файлы по
+        сети). Пока сервер не слушает, скроллить нельзя — ingest'ы будут падать с
+        «refused». Возвращает True, если сервер поднялся, False — если бросили."""
+        url = SERVER_BASE + "/api/dl/status"
+        deadline = time.time() + AUTOSCROLL_WAIT_SERVER
+        announced = False
+        while not self._stop.is_set() and time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=3) as resp:
+                    resp.read()
+                return True
+            except Exception:  # noqa: BLE001
+                if not announced:
+                    self.on_log("[cdp] автоскролл ждёт запуска сервера (идёт сверка файлов)...")
+                    announced = True
+                time.sleep(2)
+        return not self._stop.is_set()
+
+    def _scroll_once(self):
+        """Один шаг скролла. Возвращает (pos, height): докуда долистали и полная
+        высота ленты. Рост height = подгрузились новые карточки."""
+        result = self._send("Runtime.evaluate",
+                             {"expression": _SCROLL_JS, "returnByValue": True},
+                             wait=True, timeout=8)
+        try:
+            val = (result or {}).get("result", {}).get("value") or [0, 0]
+            return int(val[0]), int(val[1])
+        except (TypeError, ValueError, IndexError):
+            return 0, 0
+
+    def _autoscroll_loop(self):
+        """Ждём сервер, затем плавно крутим ленту вниз по одному экрану за шаг,
+        пока высота растёт. Дойдя до низа (несколько шагов без роста) — ждём и
+        пробуем снова: лента могла дорисоваться. Останавливаемся, когда и это не
+        даёт прироста."""
+        if not self._wait_server():
+            return
+        self.on_log(f"[cdp] автоскролл включён (вкладка {self.target_id})")
+        last_h = 0          # максимальная виденная высота ленты
+        idle = 0            # шагов подряд без роста высоты
+        end_rounds = 0      # подтверждений «дошли до конца» подряд
+        while not self._stop.is_set():
+            time.sleep(AUTOSCROLL_INTERVAL)
+            if self._stop.is_set():
+                break
+            pos, h = self._scroll_once()
+            if h > last_h:
+                # лента доросла — подгрузились новые карточки, продолжаем
+                last_h = h
+                idle = 0
+                end_rounds = 0
+                continue
+            idle += 1
+            # «у дна» = докрутили почти до самой высоты (виртуализация оставляет
+            # небольшой зазор, поэтому сравниваем с допуском)
+            at_bottom = h > 0 and pos >= h - 1500
+            if idle < AUTOSCROLL_IDLE_PASSES or not at_bottom:
+                continue
+            # высота не растёт и мы у дна — возможно конец. Подтверждаем несколько
+            # раз с долгой паузой и лёгкой «встряской» (чуть вверх -> снова вниз),
+            # чтобы добудить ленивую подгрузку при медленном ЦОД.
+            idle = 0
+            end_rounds += 1
+            if end_rounds >= AUTOSCROLL_END_ROUNDS:
+                self.on_log(f"[cdp] автоскролл: лента промотана до конца "
+                            f"(высота {last_h}px, вкладка {self.target_id})")
+                break
+            self._send("Runtime.evaluate",
+                       {"expression": "window.scrollBy(0,-1200)", "returnByValue": True},
+                       wait=False)
+            time.sleep(AUTOSCROLL_INTERVAL * 3)
 
 
 class CDPCapture:
