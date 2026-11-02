@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
@@ -68,6 +68,15 @@ _files_dir_holder = _FilesDirHolder(DEFAULT_FILES_DIR)
 
 def files_dir():
     return _files_dir_holder.path
+
+
+def resolve_root(stored_root):
+    """Корень, под которым лежит файл. Новые записи хранят dl_root/vd_root = NULL
+    (путь относительный — файл под ТЕКУЩЕЙ files_dir(), что переживает смену папки).
+    Старые записи хранят абсолютный корень — используем его как есть (совместимость)."""
+    if stored_root:
+        return os.path.abspath(os.path.expanduser(stored_root))
+    return files_dir()
 
 
 def validate_writable_dir(path):
@@ -149,6 +158,13 @@ MAX_THREADS = 32
 SIZE_ORDER = ["ORIGINAL", "XXXL", "XXL", "XL", "L", "M", "S", "XS", "XXS", "XXXS", "DEFAULT"]
 ATTEMPT_TIMEOUT = 10        # сек: на соединение и на ожидание каждого блока данных
 ATTEMPT_DEADLINE = 180      # сек: потолок на одну попытку целиком (против «капающих» соединений)
+# Ретрай на ВРЕМЕННЫХ ошибках (таймаут, обрыв, 5xx, 429): файл не хоронится в
+# failed сразу, а возвращается в очередь с отложенным временем (backoff), чтобы
+# воркеры взяли его позже — за это время реплика ЦОД может ожить. Постоянные
+# ошибки (нет ссылок, html/404) по-прежнему идут в failed без ретраев.
+SOFT_RETRY_MAX = int(os.environ.get("YDISK_SOFT_RETRY_MAX", "8"))   # сколько «мягких» заходов до failed
+SOFT_RETRY_BASE = 30        # сек: база backoff; задержка = BASE * попытка (кап SOFT_RETRY_CAP)
+SOFT_RETRY_CAP = 600        # сек: максимальная задержка перед повторной попыткой
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 DL_COLUMNS = {
@@ -212,13 +228,26 @@ app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
 VIDEO_EXT = {"mov", "mp4", "m4v", "avi", "mkv", "3gp", "mts", "webm"}
 NAME_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})-(\d{2})")
 
+# --- verbose logging: set YDISK_DEBUG=1 to see timing/progress to stderr ---
+_DEBUG = bool(os.environ.get("YDISK_DEBUG"))
+_t0 = time.time()
+
+
+def dlog(msg):
+    """Debug log with elapsed seconds since import. Goes to stderr, flushed."""
+    if _DEBUG:
+        sys.stderr.write(f"[ydisk +{time.time() - _t0:7.2f}s] {msg}\n")
+        sys.stderr.flush()
+
 
 # ---------------------------------------------------------------- DB
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=60)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_mode=WAL")      # писатель не блокирует читателей
+    conn.execute("PRAGMA busy_timeout=60000")    # при занятой БД ждать до 60с, не падать с 'locked'
+    conn.execute("PRAGMA synchronous=NORMAL")    # безопасно для WAL, заметно быстрее записи
     return conn
 
 
@@ -273,6 +302,11 @@ def init_db():
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def now_iso_offset(seconds: float):
+    """ISO-время через `seconds` секунд от текущего момента (для отложенных ретраев)."""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def name_from_path(path: str) -> str:
@@ -390,9 +424,13 @@ def ingest(payload: dict):
 
         after = c.execute("SELECT COUNT(*) FROM items").fetchone()[0]
 
-    # Если данные о файле появились уже после запуска, тоже проверяем, не лежит ли
-    # он на диске с предыдущего запуска/версии программы.
-    reconcile_existing_downloads(affected_paths)
+    # Сверка с диском после ingest идёт по СЕТИ (SMB) и может быть медленной. При
+    # автоскролле ingest'ы частые, поэтому НЕ держим ответ и НЕ плодим по потоку
+    # reconcile на каждый ingest (это создавало кучу параллельных писателей в
+    # SQLite -> 'database is locked' -> HTTP 500). Вместо этого складываем пути в
+    # общую очередь, а ОДИН фоновый воркер (reconcile_worker) разбирает их пачками.
+    if affected_paths:
+        schedule_reconcile(affected_paths)
 
     return {
         "clusters": len(clusters),
@@ -402,12 +440,66 @@ def ingest(payload: dict):
     }
 
 
+# --- отложенная сверка с диском: один фоновый воркер вместо потока-на-ingest ---
+# ingest кладёт затронутые пути сюда; воркер раз в RECONCILE_DEBOUNCE секунд
+# забирает накопленное и делает ОДИН reconcile на всю пачку. Так запись в SQLite
+# от сверки не конкурирует сама с собой и не мешает ни ingest, ни скачиванию.
+RECONCILE_DEBOUNCE = 1.5
+_reconcile_pending = set()
+_reconcile_lock = threading.Lock()
+_reconcile_wake = threading.Event()
+_reconcile_started = [False]
+
+
+def schedule_reconcile(paths):
+    with _reconcile_lock:
+        _reconcile_pending.update(p for p in paths if p)
+        if not _reconcile_started[0]:
+            start_reconcile_worker()
+            _reconcile_started[0] = True
+    _reconcile_wake.set()
+
+
+def _reconcile_worker():
+    while True:
+        _reconcile_wake.wait()
+        time.sleep(RECONCILE_DEBOUNCE)   # дать накопиться пачке (дебаунс)
+        with _reconcile_lock:
+            batch = _reconcile_pending.copy()
+            _reconcile_pending.clear()
+            _reconcile_wake.clear()
+        if not batch:
+            continue
+        try:
+            reconcile_existing_downloads(batch)
+        except Exception as e:  # noqa: BLE001
+            dlog(f"reconcile worker error: {type(e).__name__}: {e}")
+
+
+def start_reconcile_worker():
+    t = threading.Thread(target=_reconcile_worker, name="reconcile-worker", daemon=True)
+    t.start()
+    return t
+
+
 @app.post("/api/ingest")
 def api_ingest():
     payload = request.get_json(force=True, silent=True)
     if not isinstance(payload, dict):
         return jsonify(error="expected JSON object"), 400
-    result = ingest(payload)
+    try:
+        result = ingest(payload)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            with open(os.path.join(BASE_DIR, "ingest_error.log"), "a", encoding="utf-8") as f:
+                f.write(f"\n--- {now_iso()} ---\n{tb}\n")
+        except OSError:
+            pass
+        sys.stderr.write(tb)
+        sys.stderr.flush()
+        return jsonify(error=f"{type(e).__name__}: {e}"), 500
     print(f"[ingest] {result}")
     return jsonify(result)
 
@@ -1057,11 +1149,27 @@ def reconcile_existing_downloads(paths=None):
     Если старый статус done указывает на устаревший корень, при обнаружении файла
     в другом известном каталоге обновляем только путь к нему.
     """
+    _rec_t = time.time()
+    dlog(f"reconcile START (paths={'all' if paths is None else len(paths)})")
     roots = []
     for candidate in (files_dir(), DEFAULT_FILES_DIR):
         root = os.path.abspath(os.path.expanduser(candidate))
         if root not in roots:
             roots.append(root)
+    dlog(f"reconcile roots={roots}")
+
+    # os.path.realpath на сетевом пути (SMB) обращается к серверу и МЕДЛЕННЫЙ.
+    # Раньше он звался в горячем цикле на каждую строку × каждый корень — это и
+    # вешало reconcile. Кэшируем результат: один сетевой вызов на уникальный путь.
+    _real_cache = {}
+    def real(p):
+        r = _real_cache.get(p)
+        if r is None:
+            r = os.path.realpath(p)
+            _real_cache[p] = r
+        return r
+
+    roots = [real(r) for r in roots]   # предвычисляем один раз
 
     if paths is None:
         with dbc() as c:
@@ -1070,6 +1178,7 @@ def reconcile_existing_downloads(paths=None):
                 "vd_status,vd_file,vd_root,vd_lost,vd_note FROM items "
                 "ORDER BY CASE WHEN dl_status='done' OR vd_status='done' THEN 0 ELSE 1 END, path"
             ).fetchall()
+        dlog(f"reconcile loaded {len(rows)} rows in {time.time() - _rec_t:.2f}s")
     else:
         unique_paths = list(dict.fromkeys(str(p) for p in paths if p))
         rows = []
@@ -1085,40 +1194,110 @@ def reconcile_existing_downloads(paths=None):
                     batch,
                 ).fetchall())
 
-    # Кэшируем имена файлов по каталогу с датой — тысячи элементов одного дня
-    # не должны приводить к тысячам повторных os.listdir().
+    # Индекс содержимого папки: {(realpath(root), day): {name: size}}.
+    # На сетевой папке (SMB) главный тормоз — round-trip'ы по сети. Поэтому при
+    # ПОЛНОМ reconcile (paths is None) читаем всю структуру одним рекурсивным
+    # обходом os.walk на каждый корень (минимум обращений к сети), а потом сверка
+    # идёт полностью в памяти. При инкрементальном reconcile (после ingest, когда
+    # затронуто мало дней) читаем нужные дни лениво через scandir.
     dir_cache = {}
     claimed = {}
     counts = {"photos": 0, "videos": 0, "repaired_roots": 0}
+    stats = {"listdir_calls": 0, "listdir_time": 0.0, "verify_calls": 0, "verify_time": 0.0,
+             "locate_calls": 0}
     now = now_iso()
+
+    def _scan_day(root, day):
+        files = {}
+        try:
+            with os.scandir(os.path.join(root, day)) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file():
+                            files[entry.name] = entry.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return files
+
+    def preload_tree(root):
+        """Один os.walk: читает всю структуру корня в dir_cache за один проход."""
+        _wt = time.time()
+        root_real = real(root)
+        n_files = n_dirs = 0
+        try:
+            for cur, _subdirs, filenames in os.walk(root):
+                rel_day = os.path.relpath(cur, root)
+                day = "." if rel_day == os.curdir else rel_day
+                bucket = {}
+                for fn in filenames:
+                    try:
+                        bucket[fn] = os.path.getsize(os.path.join(cur, fn))
+                    except OSError:
+                        pass
+                dir_cache[(root_real, day)] = bucket
+                n_dirs += 1
+                n_files += len(bucket)
+        except OSError:
+            pass
+        stats["listdir_calls"] += 1
+        stats["listdir_time"] += time.time() - _wt
+        dlog(f"reconcile preload {root}: {n_files} files in {n_dirs} dirs, "
+             f"{time.time() - _wt:.2f}s")
+
+    full_scan = paths is None
+    if full_scan:
+        for root in roots:
+            preload_tree(root)
+
+    def dir_files(root, day):
+        """{имя_файла: размер} каталога root/day. При полном reconcile всё уже в
+        dir_cache (из preload_tree); иначе лениво сканируем нужный день."""
+        key = (real(root), day)
+        cached = dir_cache.get(key)
+        if cached is not None:
+            return cached
+        if full_scan:
+            # дерево уже прочитано целиком; отсутствие ключа = каталога нет
+            dir_cache[key] = {}
+            return dir_cache[key]
+        _lt = time.time()
+        files = _scan_day(root, day)
+        stats["listdir_calls"] += 1
+        stats["listdir_time"] += time.time() - _lt
+        dir_cache[key] = files
+        return files
 
     def root_order(row, is_video):
         saved = row["vd_root"] if is_video else row["dl_root"]
         ordered = []
         if saved:
-            ordered.append(os.path.abspath(os.path.expanduser(saved)))
-        ordered.extend(roots)
+            ordered.append(real(os.path.abspath(os.path.expanduser(saved))))
+        ordered.extend(roots)   # уже realpath
         out = []
         for item in ordered:
-            real = os.path.realpath(item)
-            if real not in out:
-                out.append(real)
+            if item not in out:
+                out.append(item)
         return out
 
     def try_relative(root, rel, item_path):
+        """Есть ли файл root/rel (по кэшу каталога-дня). Без сетевого stat на файл."""
         if not rel:
             return None
         rel_norm = os.path.normpath(str(rel))
-        owner = claimed.get((os.path.realpath(root), rel_norm))
+        root_real = real(root)
+        owner = claimed.get((root_real, rel_norm))
         if owner and owner != item_path:
             return None
-        try:
-            candidate = verify_saved_file(root, rel_norm, min_size=1)
-            size = os.path.getsize(candidate)
-        except (OSError, TypeError, ValueError):
+        day = os.path.dirname(rel_norm) or "."
+        base = os.path.basename(rel_norm)
+        stats["verify_calls"] += 1
+        size = dir_files(root, day).get(base)
+        if size is None or size < 1:
             return None
-        return {"root": os.path.realpath(root), "rel": rel_norm, "size": size,
-                "label": None, "recovered": ".recovered" in os.path.basename(rel_norm)}
+        return {"root": root_real, "rel": rel_norm, "size": size,
+                "label": None, "recovered": ".recovered" in base}
 
     def locate(row, is_video):
         field_file = "vd_file" if is_video else "dl_file"
@@ -1134,18 +1313,22 @@ def reconcile_existing_downloads(paths=None):
                 if match:
                     return match
 
-        # Иначе пытаемся сопоставить файлы по дате, исходному имени и схеме имён загрузчика.
+        # День файла (все кандидаты лежат в одном дне). Если каталога этого дня
+        # нет ни в одном корне — выходим сразу, НЕ генерируя ~120 кандидатов имён
+        # (это и была основная CPU-нагрузка: большинство элементов не скачаны, их
+        # дни пусты, а мы впустую строили кандидаты на каждый).
+        day = (row["taken"] or "")[:10] or "no-date"
+        day_dirs = [dir_files(root, day) for root in roots_for_item]
+        if not any(day_dirs):
+            return None
+
+        # Иначе сопоставляем по дате, исходному имени и схеме имён загрузчика.
         candidates = _local_file_candidates(row, is_video)
-        for root in roots_for_item:
+        for root, files in zip(roots_for_item, day_dirs):
+            if not files:
+                continue
             for rel, label, recovered in candidates:
-                day = os.path.dirname(rel) or "."
-                cache_key = (root, day)
-                if cache_key not in dir_cache:
-                    try:
-                        dir_cache[cache_key] = set(os.listdir(os.path.join(root, day)))
-                    except OSError:
-                        dir_cache[cache_key] = set()
-                if os.path.basename(rel) not in dir_cache[cache_key]:
+                if os.path.basename(rel) not in files:
                     continue
                 match = try_relative(root, rel, row["path"])
                 if match:
@@ -1154,8 +1337,16 @@ def reconcile_existing_downloads(paths=None):
                     return match
         return None
 
+    dlog(f"reconcile scanning {len(rows)} rows...")
+    _loop_t = time.time()
     with dbc() as c:
-        for row in rows:
+        for _i, row in enumerate(rows):
+            if _i and _i % 500 == 0:
+                dlog(f"reconcile {_i}/{len(rows)} rows, "
+                     f"listdir={stats['listdir_calls']}({stats['listdir_time']:.1f}s) "
+                     f"verify={stats['verify_calls']}({stats['verify_time']:.1f}s) "
+                     f"found p={counts['photos']} v={counts['videos']} "
+                     f"elapsed={time.time() - _loop_t:.1f}s")
             if not row["path"] or not row["name"]:
                 continue
             is_video = (row["mediatype"] == "video" or
@@ -1164,6 +1355,7 @@ def reconcile_existing_downloads(paths=None):
             file_key = "vd_file" if is_video else "dl_file"
             root_key = "vd_root" if is_video else "dl_root"
             is_already_done = row[status_key] == "done"
+            stats["locate_calls"] += 1
             match = locate(row, is_video)
             if not match:
                 # Важно: не сбрасываем done, даже если файла больше нет на диске.
@@ -1176,6 +1368,9 @@ def reconcile_existing_downloads(paths=None):
             size = match["size"]
             old_root = row[root_key]
             old_rel = row[file_key]
+            # Если файл лежит под текущей files_dir() — храним относительный путь
+            # (root=NULL). Если в другом каталоге (напр. старый дефолт) — абсолютный.
+            store_root = None if real(root) == real(files_dir()) else root
 
             if is_video:
                 # Если обнаружен восстановленный вариант, точный объём потерь неизвестен;
@@ -1185,24 +1380,28 @@ def reconcile_existing_downloads(paths=None):
                     "vd_bytes=?, vd_lost=COALESCE(vd_lost,0), vd_error=NULL, "
                     "vd_note=CASE WHEN vd_status='done' THEN COALESCE(vd_note, ?) ELSE ? END, "
                     "vd_at=COALESCE(vd_at, ?) WHERE path=?",
-                    (rel, root, size, LOCAL_EXISTING_FILE_NOTE, LOCAL_EXISTING_FILE_NOTE, now, row["path"]),
+                    (rel, store_root, size, LOCAL_EXISTING_FILE_NOTE, LOCAL_EXISTING_FILE_NOTE, now, row["path"]),
                 )
             else:
                 label = match["label"] or row["dl_size"] or "ORIGINAL"
                 c.execute(
                     "UPDATE items SET dl_status='done', dl_size=?, dl_file=?, dl_root=?, dl_bytes=?, "
                     "dl_error=NULL, dl_attempts=NULL, dl_at=COALESCE(dl_at, ?) WHERE path=?",
-                    (label, rel, root, size, now, row["path"]),
+                    (label, rel, store_root, size, now, row["path"]),
                 )
 
             if is_already_done:
-                if old_root != root or old_rel != rel:
+                if old_root != store_root or old_rel != rel:
                     counts["repaired_roots"] += 1
             elif is_video:
                 counts["videos"] += 1
             else:
                 counts["photos"] += 1
 
+    dlog(f"reconcile DONE in {time.time() - _rec_t:.2f}s: {counts} | "
+         f"listdir={stats['listdir_calls']} ({stats['listdir_time']:.1f}s), "
+         f"verify={stats['verify_calls']} ({stats['verify_time']:.1f}s), "
+         f"locate={stats['locate_calls']}")
     return counts
 
 
@@ -1225,6 +1424,29 @@ class Aborted(Exception):
 
 class DeadlineError(Exception):
     """Попытка длится дольше ATTEMPT_DEADLINE."""
+
+
+# HTTP-коды, которые при аварии ЦОД означают «попробуй позже», а не «файла нет».
+TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def is_transient(e) -> bool:
+    """Временная ли ошибка (стоит повторить позже), в отличие от постоянной."""
+    if isinstance(e, (DeadlineError, socket.timeout, TimeoutError)):
+        return True
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in TRANSIENT_HTTP
+    if isinstance(e, urllib.error.URLError):
+        r = e.reason
+        if isinstance(r, (socket.timeout, TimeoutError)):
+            return True
+        return isinstance(r, OSError)   # сброс соединения, DNS, недоступность — временно
+    if isinstance(e, (ConnectionError, socket.gaierror)):
+        return True
+    if isinstance(e, IOError):
+        # «неполный файл» / «пустой ответ» — обрыв на стороне ЦОД, стоит повторить
+        return True
+    return False
 
 
 def build_opener():
@@ -1315,10 +1537,15 @@ class Downloader:
     # ---------- менеджер
 
     def refill(self):
-        """Держит в очереди ровно QUEUE_SIZE ожидающих файлов (самые верхние в галерее — первыми)."""
+        """Держит в очереди ровно QUEUE_SIZE готовых к работе файлов (самые верхние
+        в галерее — первыми). Отложенные ретраи (dl_at в будущем) не считаются
+        занятыми слотами — иначе backoff-записи заблокировали бы добор новой работы."""
         with self.refill_lock:
             with dbc() as c:
-                have = c.execute("SELECT COUNT(*) FROM items WHERE dl_status='queued'").fetchone()[0]
+                have = c.execute(
+                    "SELECT COUNT(*) FROM items WHERE dl_status='queued' "
+                    "AND (dl_at IS NULL OR dl_at <= ?)", (now_iso(),)
+                ).fetchone()[0]
                 need = QUEUE_SIZE - have
                 if need <= 0:
                     return
@@ -1375,8 +1602,12 @@ class Downloader:
     def _claim(self):
         with self.claim_lock:
             with dbc() as c:
+                # dl_at у отложенных ретраев хранит время готовности (в будущем).
+                # Берём только «дозревшие»: dl_at пуст или уже наступил.
                 row = c.execute(
-                    f"SELECT path,name,taken,raw FROM items WHERE dl_status='queued' {GALLERY_ORDER} LIMIT 1"
+                    f"SELECT path,name,taken,raw FROM items WHERE dl_status='queued' "
+                    f"AND (dl_at IS NULL OR dl_at <= ?) {GALLERY_ORDER} LIMIT 1",
+                    (now_iso(),)
                 ).fetchone()
                 if not row:
                     return None
@@ -1398,9 +1629,12 @@ class Downloader:
             self.refill()
 
     def _set_item(self, path, status, size=None, file=None, nbytes=None, error=None, attempts=None):
-        # Запоминаем корень отдельно: смена папки сохранения не должна ломать доступ
-        # к файлам, которые были скачаны раньше.
-        saved_root = os.path.abspath(files_dir()) if status == "done" else None
+        # Корень НЕ храним (dl_root=NULL): путь dl_file относительный от текущей
+        # files_dir(). Так смена папки сохранения не ломает доступ к файлам, и в
+        # БД нет привязки к конкретному абсолютному пути. resolve_root() при
+        # чтении подставит текущую files_dir() для NULL и абсолютный корень для
+        # старых записей (обратная совместимость).
+        saved_root = None
         with dbc() as c:
             c.execute(
                 "UPDATE items SET dl_status=?, dl_size=?, dl_file=?, dl_root=?, dl_bytes=?, dl_error=?, dl_attempts=?, dl_at=? WHERE path=?",
@@ -1421,6 +1655,33 @@ class Downloader:
         self._set_item(path, "failed", error=error, attempts=attempts)
         self._on_result(False)
 
+    def _soft_attempts(self, path):
+        """Сколько «мягких» заходов уже было у файла (хранится в dl_attempts как _soft_n)."""
+        with dbc() as c:
+            row = c.execute("SELECT dl_attempts FROM items WHERE path=?", (path,)).fetchone()
+        if not row or not row[0]:
+            return 0
+        try:
+            data = json.loads(row[0])
+            if isinstance(data, dict):
+                return int(data.get("_soft_n", 0))
+        except (ValueError, TypeError):
+            pass
+        return 0
+
+    def _requeue_soft(self, path, n, error, attempts):
+        """Временная ошибка: не в failed, а назад в очередь с задержкой (backoff).
+        dl_at ставим в будущее — _claim берёт только «дозревшие» записи."""
+        delay = min(SOFT_RETRY_CAP, SOFT_RETRY_BASE * n)
+        ready_at = now_iso_offset(delay)
+        payload = {"_soft_n": n, "last_error": (error or "")[:300], "tries": attempts}
+        with dbc() as c:
+            c.execute(
+                "UPDATE items SET dl_status='queued', dl_error=?, dl_attempts=?, dl_at=? WHERE path=?",
+                (f"ретрай {n}/{SOFT_RETRY_MAX} через {delay}с: {(error or '')[:200]}",
+                 json.dumps(payload, ensure_ascii=False), ready_at, path),
+            )
+
     def _process(self, row):
         path, name = row["path"], row["name"]
         day = (row["taken"] or "")[:10] or "no-date"
@@ -1439,6 +1700,7 @@ class Downloader:
         with self.alock:
             self.active[path] = prog
         attempts = []
+        had_transient = False
         try:
             for i, size in enumerate(order, 1):
                 if self.stop_event.is_set():
@@ -1453,10 +1715,19 @@ class Downloader:
                     raise
                 except Exception as e:  # noqa: BLE001
                     attempts.append(f"{size}: {short_err(e)}")
+                    if is_transient(e):
+                        had_transient = True
                     continue
                 self._set_item(path, "done", size=size, file=rel, nbytes=nbytes, attempts=attempts)
                 self._on_result(True, nbytes)
                 return
+            # Все размеры не удались. Если причина временная (таймаут/5xx/обрыв) и
+            # лимит мягких ретраев не исчерпан — назад в очередь с задержкой, а не в failed.
+            if had_transient:
+                n = self._soft_attempts(path) + 1
+                if n <= SOFT_RETRY_MAX:
+                    self._requeue_soft(path, n, "; ".join(attempts), attempts)
+                    return
             self._record_fail(path, "; ".join(attempts), attempts)
         except Aborted:
             self._set_item(path, None)
@@ -1534,6 +1805,7 @@ class Downloader:
     # ---------- статус для страницы
 
     def snapshot(self):
+        _now = now_iso()
         with dbc() as c:
             r = c.execute(
                 f"""SELECT
@@ -1545,11 +1817,14 @@ class Downloader:
                     COALESCE(SUM(dl_status='queued'),0),
                     COALESCE(SUM(dl_status='downloading'),0),
                     COALESCE(SUM({ELIGIBLE}),0),
-                    COALESCE(SUM(CASE WHEN dl_status='done' THEN dl_bytes END),0)
-                FROM items"""
+                    COALESCE(SUM(CASE WHEN dl_status='done' THEN dl_bytes END),0),
+                    COALESCE(SUM(dl_status='queued' AND dl_at IS NOT NULL AND dl_at > ?),0)
+                FROM items""",
+                (_now,)
             ).fetchone()
             counts = dict(zip(
-                ["images", "with_links", "no_links", "done", "failed", "queued", "downloading", "remaining", "done_bytes"],
+                ["images", "with_links", "no_links", "done", "failed", "queued", "downloading",
+                 "remaining", "done_bytes", "retrying"],
                 list(r),
             ))
             by_size = {s: n for s, n in c.execute(
@@ -1857,7 +2132,8 @@ class VideoDownloader:
             self.refill()
 
     def _set_video(self, path, status, phase=None, file=None, nbytes=None, lost=None, error=None, note=None):
-        saved_root = os.path.abspath(files_dir()) if status == "done" else None
+        # vd_root=NULL: путь vd_file относительный от текущей files_dir() (см. _set_item).
+        saved_root = None
         with dbc() as c:
             c.execute(
                 "UPDATE items SET vd_status=?, vd_phase=?, vd_file=?, vd_root=?, vd_bytes=?, vd_lost=?, vd_error=?, vd_note=?, vd_at=? "
@@ -2501,6 +2777,7 @@ STATUS_HTML = r"""<!doctype html>
       [c.remaining, 'ещё не в очереди'],
       [c.queued + ' / ' + s.queue_size, 'в ожидании'],
       [c.downloading + ' / ' + s.threads, 'качается'],
+      [c.retrying || 0, 'ждут ретрая (таймауты)'],
       [c.failed, 'ошибок'],
       [c.no_links, 'фото без ссылок'],
     ];
@@ -2757,11 +3034,12 @@ def _done_file(rid):
         return None
     if row["vd_status"] == "done" and row["vd_file"]:
         rel = row["vd_file"]
-        # Для строк из старых баз, где корень ещё не хранился, используем путь по умолчанию.
-        root = row["vd_root"] or DEFAULT_FILES_DIR
+        # NULL root -> текущая files_dir() (относительный путь); иначе сохранённый
+        # абсолютный корень (старые записи). См. resolve_root().
+        root = resolve_root(row["vd_root"])
     elif row["dl_status"] == "done" and row["dl_file"]:
         rel = row["dl_file"]
-        root = row["dl_root"] or DEFAULT_FILES_DIR
+        root = resolve_root(row["dl_root"])
     else:
         return None
     root = os.path.realpath(os.path.abspath(root))

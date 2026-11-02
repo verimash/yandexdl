@@ -54,27 +54,52 @@ class ServerThread(threading.Thread):
         self.base_url = None
 
     def run(self):
+        import traceback
+        try:
+            self._run_impl()
+        except Exception:  # noqa: BLE001
+            # Без этого исключение в фоновом потоке уходит в никуда, и сервер
+            # молча не поднимается (на 8001 никто не слушает). Печатаем в stderr.
+            sys.stderr.write("[server] FATAL in ServerThread.run:\n")
+            traceback.print_exc()
+            sys.stderr.flush()
+            self.on_log("[server] FATAL: сервер не запустился, см. stderr/лог")
+
+    def _run_impl(self):
+        def log(msg):
+            sys.stderr.write(f"[server] {msg}\n")
+            sys.stderr.flush()
+            self.on_log(msg)
+
+        log("импорт модуля server...")
         mod = _import_server_module()
         self._mod = mod
+        log(f"DB={mod.DB_PATH}")
 
+        log("init_db...")
         mod.init_db()
+        log("init_auth_db...")
         mod.init_auth_db()
-        # Apply a previously selected output directory before scanning files.
+        log("load_files_dir_setting...")
         mod.load_files_dir_setting()
+        log(f"files_dir={mod.files_dir()}")
         os.makedirs(mod.files_dir(), exist_ok=True)
         os.makedirs(mod.THUMBS_DIR, exist_ok=True)
-        self.on_log(f"[server] проверка существующих файлов: {mod.reconcile_existing_downloads()}")
+        log("reconcile_existing_downloads... (может быть долго на сетевой папке)")
+        res = mod.reconcile_existing_downloads()
+        log(f"reconcile готово: {res}")
         mod.cleanup_part_files()
         mod.DL.load_settings()
         mod.VD.load_settings()
 
         if not shutil.which("ffmpeg"):
-            self.on_log("(!) ffmpeg не найден в PATH — видео собрать не выйдет")
+            log("(!) ffmpeg не найден в PATH — видео собрать не выйдет")
 
         self.base_url = f"http://{mod.HOST}:{mod.PORT}"
-        self.on_log(f"[server] галерея: {self.base_url}/   статус: {self.base_url}/status")
+        log(f"запускаю сервер: {self.base_url}/   статус: {self.base_url}/status")
 
         self._srv = make_server(mod.HOST, mod.PORT, mod.app, threaded=True)
+        log("сервер слушает, serve_forever()")
         self._srv.serve_forever()
 
     def stop(self):
